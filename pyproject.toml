@@ -1,0 +1,13 @@
+[project]
+name = "secure-research-tool"
+version = "0.1.0"
+description = "Secure pipeline for AI-driven extraction of structured data from untrusted web sources"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]",
+    "httpx",
+    "anthropic",
+]
+
+[project.scripts]
+secure-research-tool = "mcp_server:mcp.run"

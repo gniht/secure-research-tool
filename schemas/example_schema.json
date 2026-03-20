@@ -1,0 +1,25 @@
+{
+  "schema_id": "example_v1",
+  "version": 1,
+  "domain": "example",
+  "description": "Example schema showing the format callers should provide. Replace with your domain-specific schema.",
+  "fields": {
+    "name": {
+      "type": "string",
+      "max_length": 200,
+      "description": "The name of the thing being researched",
+      "required": true
+    },
+    "count": {
+      "type": "int",
+      "range": [0, 10000],
+      "description": "A numeric count of something",
+      "required": false
+    },
+    "enabled": {
+      "type": "bool",
+      "description": "Whether some feature is present",
+      "required": false
+    }
+  }
+}
