@@ -41,12 +41,16 @@ def cmd_research(args):
 
     schema = load_schema(Path(args.schema))
 
+    user_urls = args.url if args.url else None
+
     print(f"Starting research pipeline...")
     print(f"  Topic: {args.topic}")
     print(f"  Domain: {schema['domain']}")
     print(f"  Schema: {schema['schema_id']}")
     print(f"  Trust level: {args.trust_level}")
     print(f"  Max sources: {args.max_sources}")
+    if user_urls:
+        print(f"  URLs provided: {len(user_urls)}")
     print()
 
     try:
@@ -55,6 +59,7 @@ def cmd_research(args):
             schema=schema,
             trust_level=args.trust_level,
             max_sources=args.max_sources,
+            urls=user_urls,
         ))
     except SchemaError as e:
         print(f"Schema error: {e}")
@@ -196,6 +201,9 @@ def main():
                                  help="Trust level for validation strictness")
     research_parser.add_argument("--max-sources", type=int, default=3,
                                  help="Maximum number of sources to fetch")
+    research_parser.add_argument("--url", action="append",
+                                 help="Specific URL(s) to fetch (repeatable). "
+                                 "If fewer than max-sources, additional sources are searched.")
 
     # sanitize command
     sanitize_parser = subparsers.add_parser("sanitize", help="Sanitize raw HTML/text content")

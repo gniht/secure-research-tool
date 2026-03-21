@@ -16,10 +16,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anthropic
+import httpx
+from duckduckgo_search import AsyncDDGS
+
 _PROJECT_DIR = Path(__file__).parent
 
 from validation.sanitizer import sanitize, SanitizeResult
 from validation.schema_validator import validate_extraction, ValidationResult
+
+
+# --- Model Configuration ---
+
+SEARCH_MODEL = "claude-sonnet-4-6"
+EXTRACT_MODEL = "claude-opus-4-6"
+ANALYST_MODEL = "claude-opus-4-6"
 
 
 # --- Errors ---
@@ -124,26 +135,170 @@ def validate_caller_schema(schema: dict) -> ValidationResult:
     return result
 
 
-# --- Stage 1: Fetch & Sanitize ---
+# --- Stage 1a: URL Discovery (search agent) ---
 
 
-async def fetch_and_sanitize(
+async def _execute_web_search(query: str, max_results: int = 10) -> list[dict]:
+    """Run a DuckDuckGo search. Returns list of {title, url, snippet}."""
+    async with AsyncDDGS() as ddgs:
+        results = await ddgs.atext(query, max_results=max_results)
+    return [
+        {"title": r["title"], "url": r["href"], "snippet": r["body"]}
+        for r in results
+    ]
+
+
+def _parse_json_from_text(text: str) -> dict:
+    """Parse JSON from agent response text, stripping markdown code blocks if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Strip code block markers
+        lines = text.split("\n")
+        # Remove first line (```json or ```) and last line (```)
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    return json.loads(text)
+
+
+async def discover_sources(
     topic: str,
     max_sources: int,
     source_hints: list[str] | None = None,
-) -> list[SanitizedSource]:
+) -> list[str]:
     """
-    Fetch web pages about the topic and sanitize each one.
+    Use the search agent to find relevant URLs for a topic.
 
-    Stage 1 of the pipeline — no AI involved.
+    The search agent (Sonnet) constructs search queries, evaluates results
+    via DuckDuckGo, and returns the most relevant URLs.
     """
-    # TODO: Implement web search + HTTP fetching
-    # Needs: search mechanism (e.g., DuckDuckGo), HTTP client (httpx)
-    # Each fetched page gets run through sanitize() from validation/sanitizer.py
-    raise NotImplementedError(
-        "Web fetching not yet implemented. "
-        "Needs web search and HTTP client."
+    client = anthropic.AsyncAnthropic()
+
+    search_tool = {
+        "name": "web_search",
+        "description": (
+            "Search the web for pages relevant to the research topic. "
+            "Returns a list of results with title, URL, and snippet."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to execute",
+                }
+            },
+            "required": ["query"],
+        },
+    }
+
+    agent_spec = (_PROJECT_DIR / "agents" / "search.md").read_text()
+    safe_topic = _sanitize_for_prompt(topic)
+
+    user_message = f"**Topic:** {safe_topic}\n"
+    if source_hints:
+        user_message += f"**Source hints:** {', '.join(source_hints)}\n"
+    user_message += f"**Max URLs to return:** {max_sources}\n"
+
+    messages = [{"role": "user", "content": user_message}]
+
+    # Tool use loop — agent calls web_search, we execute it, repeat until done
+    while True:
+        response = await client.messages.create(
+            model=SEARCH_MODEL,
+            max_tokens=1024,
+            system=agent_spec,
+            tools=[search_tool],
+            messages=messages,
+        )
+
+        if response.stop_reason == "tool_use":
+            # Execute each tool call
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use" and block.name == "web_search":
+                    try:
+                        results = await _execute_web_search(block.input["query"])
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(results),
+                        })
+                    except Exception as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps({"error": str(e)}),
+                            "is_error": True,
+                        })
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # Agent is done — extract JSON from final response
+            break
+
+    # Parse the agent's final response
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    try:
+        result = _parse_json_from_text(text)
+    except (json.JSONDecodeError, ValueError):
+        raise FetchError("Search agent returned invalid JSON")
+
+    # Extract and validate URLs
+    urls = []
+    seen = set()
+    for entry in result.get("urls", []):
+        url = entry.get("url", "")
+        if url.startswith(("http://", "https://")) and url not in seen:
+            urls.append(url)
+            seen.add(url)
+
+    return urls[:max_sources]
+
+
+# --- Stage 1b: Fetch & Sanitize (no AI) ---
+
+
+async def _fetch_single(client: httpx.AsyncClient, url: str) -> SanitizedSource:
+    """Fetch a single URL and sanitize its content."""
+    response = await client.get(url)
+    response.raise_for_status()
+
+    sanitize_result = sanitize(response.text)
+
+    return SanitizedSource(
+        url=url,
+        fetch_date=datetime.now(timezone.utc).isoformat(),
+        sanitized_text=sanitize_result.text,
+        sanitize_result=sanitize_result,
     )
+
+
+async def fetch_and_sanitize(urls: list[str]) -> list[SanitizedSource]:
+    """
+    Fetch web pages at the given URLs and sanitize each one.
+
+    No AI involved — pure HTTP fetching + deterministic sanitization.
+    Failed fetches are skipped gracefully.
+    """
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        follow_redirects=True,
+        headers={"User-Agent": "SecureResearchTool/0.1 (research pipeline)"},
+    ) as client:
+        tasks = [_fetch_single(client, url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    sources = []
+    for result in results:
+        if not isinstance(result, Exception):
+            sources.append(result)
+
+    return sources
 
 
 # --- Prompt Safety ---
@@ -391,6 +546,7 @@ async def execute_research(
     trust_level: str = "standard",
     max_sources: int = 3,
     source_hints: list[str] | None = None,
+    urls: list[str] | None = None,
 ) -> dict:
     """
     Execute the full three-stage research pipeline.
@@ -414,11 +570,31 @@ async def execute_research(
             f"Invalid schema: {'; '.join(schema_check.errors)}"
         )
 
-    # Stage 1: Fetch & Sanitize
-    sources = await fetch_and_sanitize(topic, max_sources, source_hints)
+    # Stage 1a: URL Discovery
+    all_urls = list(urls or [])
+    if len(all_urls) < max_sources:
+        remaining = max_sources - len(all_urls)
+        discovered = await discover_sources(
+            topic=topic,
+            source_hints=source_hints,
+            max_sources=remaining,
+        )
+        existing = set(all_urls)
+        for url in discovered:
+            if url not in existing:
+                all_urls.append(url)
+                existing.add(url)
+
+    if not all_urls:
+        raise FetchError(
+            "No URLs to fetch. Provide explicit URLs or a topic to search for."
+        )
+
+    # Stage 1b: Fetch & Sanitize
+    sources = await fetch_and_sanitize(all_urls)
 
     if not sources:
-        raise FetchError(f"No sources found for topic: {topic}")
+        raise FetchError("All fetch attempts failed")
 
     # Stage 2: Extract (parallel across sources)
     extraction_tasks = [

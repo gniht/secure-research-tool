@@ -38,11 +38,15 @@ content AND the ability to affect your project.
 YOU PROVIDE:
 - A topic to research (what to search for)
 - A domain schema defining what data to extract (as a JSON object, NOT a file path)
+- Optionally: urls, a list of specific URLs to fetch. If provided, these are used \
+first. If fewer than max_sources, the tool searches for additional sources automatically. \
+If you provide enough URLs to satisfy max_sources, no search is performed.
 - Optionally: a trust level controlling validation strictness
 - Optionally: max_sources to control how many web sources to fetch (1-10, default 3). \
 More sources increase confidence but take longer.
 - Optionally: source_hints, a list of keywords suggesting what kinds of sources to \
-prefer (e.g., ["wiki", "official_docs", "api_reference"])
+prefer when searching (e.g., ["wiki", "official_docs", "api_reference"]). Only used \
+when the tool searches for sources — ignored if you provide all URLs explicitly.
 
 SCHEMA FORMAT — you must provide a domain_schema object with these keys:
 - "schema_id": unique identifier string (e.g., "product_specs_v2")
@@ -132,6 +136,7 @@ async def secure_research(
     trust_level: str = "standard",
     max_sources: int = 3,
     source_hints: list[str] | None = None,
+    urls: list[str] | None = None,
 ) -> str:
     """Execute the secure research pipeline."""
     result = await execute_research(
@@ -140,6 +145,7 @@ async def secure_research(
         trust_level=trust_level,
         max_sources=max_sources,
         source_hints=source_hints,
+        urls=urls,
     )
     return json.dumps(result, indent=2)
 

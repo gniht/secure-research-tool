@@ -2,20 +2,24 @@
 
 ## Pipeline Stubs to Implement
 
-- [ ] **Stage 1: Web fetching** — `pipeline.py:fetch_and_sanitize()`
-  - Web search mechanism (e.g., DuckDuckGo) to find relevant pages for a topic
-  - Async HTTP client (httpx) to fetch pages
-  - Wire fetched content through existing `sanitizer.py`
-  - Return `SanitizedSource` objects with URL, fetch date, sanitized text
+- [x] **Stage 1a: URL discovery** — `pipeline.py:discover_sources()`
+  - Search agent (Sonnet) constructs queries and evaluates results
+  - DuckDuckGo search via tool use
+  - Agent spec: `agents/search.md`
+
+- [x] **Stage 1b: Fetch & sanitize** — `pipeline.py:fetch_and_sanitize()`
+  - Async HTTP fetching with httpx
+  - Wired through existing `sanitizer.py`
+  - User-provided URLs supported via `--url` flag / `urls` parameter
 
 - [ ] **Stage 2: Researcher agent invocation** — `pipeline.py:extract_from_source()`
-  - Call Claude API via Anthropic SDK with researcher prompt
+  - Call Claude API (Opus) with researcher prompt
   - Prompt construction already done (`_build_researcher_prompt()`)
   - Parse JSON response, handle malformed output
   - Enforce no-tools / no-web constraint via API parameters
 
 - [ ] **Stage 3: Analyst cross-referencing** — `pipeline.py:validate_and_crossref()` (multi-source path)
-  - Call Claude API with analyst prompt for 2+ extractions
+  - Call Claude API (Opus) with analyst prompt for 2+ extractions
   - Prompt construction already done (`_build_analyst_prompt()`)
   - Transform analyst output into the MCP return format
   - Single-source path already implemented
