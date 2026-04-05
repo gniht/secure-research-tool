@@ -162,10 +162,10 @@ async def validate_research_schema(domain_schema: dict) -> str:
             "errors": result.errors,
             "warnings": result.warnings,
         }, indent=2)
-    except Exception as e:
+    except Exception:
         return json.dumps({
             "valid": False,
-            "errors": [f"Schema validation failed: {e}"],
+            "errors": ["Schema validation failed unexpectedly"],
             "warnings": [],
         }, indent=2)
 

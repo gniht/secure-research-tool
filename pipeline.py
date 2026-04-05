@@ -384,9 +384,9 @@ async def extract_from_source(
 
     try:
         extraction = _parse_json_from_text(text)
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError):
         raise ExtractionError(
-            f"Researcher agent returned invalid JSON for {sanitized.url}: {e}"
+            f"Researcher agent returned invalid JSON for {sanitized.url}"
         )
 
     # Structural check — extraction key is required for downstream processing
@@ -478,6 +478,64 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
 # --- Stage 3: Validate & Cross-reference ---
 
 
+def _sanitize_extraction_for_analyst(extraction: dict) -> dict:
+    """Strip raw web content from an extraction before passing to the analyst.
+
+    The analyst should never see raw source text. It needs:
+    - The extracted field values (structured data the analyst compares)
+    - Which fields were/weren't found
+    - Anomaly metadata (type, severity, count) — but NOT descriptions
+      or source_excerpts, which contain raw web content and are a
+      second-stage injection vector.
+    - The behavioral audit output_check (structured booleans)
+
+    Explicitly excluded:
+    - field_sources: short quotes from raw web content
+    - extraction_notes: may reference source text
+    - anomaly_log descriptions/excerpts: raw web content
+    - behavioral_audit actions_declined: contains source_excerpt strings
+    """
+    sanitized = {}
+
+    # Extraction block: keep only field values and structural metadata
+    if "extraction" in extraction:
+        ext = extraction["extraction"]
+        sanitized["extraction"] = {
+            "topic": ext.get("topic"),
+            "domain": ext.get("domain"),
+            "schema_id": ext.get("schema_id"),
+            "fields": ext.get("fields", {}),
+            "fields_not_found": ext.get("fields_not_found", []),
+        }
+
+    # Behavioral audit: keep as-is (structured booleans/lists, no raw content)
+    if "behavioral_audit" in extraction:
+        audit = extraction["behavioral_audit"]
+        sanitized["behavioral_audit"] = {
+            "actions_taken": audit.get("actions_taken", []),
+            "actions_declined_count": len(audit.get("actions_declined", [])),
+            "output_check": audit.get("output_check", {}),
+        }
+
+    # Anomaly log: strip descriptions and source excerpts, keep only metadata
+    if "anomaly_log" in extraction:
+        sanitized["anomaly_log_summary"] = {
+            "count": len(extraction["anomaly_log"]),
+            "by_type": {},
+            "by_severity": {"low": 0, "medium": 0, "high": 0, "critical": 0},
+        }
+        for a in extraction["anomaly_log"]:
+            atype = a.get("type", "unknown")
+            sev = a.get("severity", "low")
+            sanitized["anomaly_log_summary"]["by_type"][atype] = (
+                sanitized["anomaly_log_summary"]["by_type"].get(atype, 0) + 1
+            )
+            if sev in sanitized["anomaly_log_summary"]["by_severity"]:
+                sanitized["anomaly_log_summary"]["by_severity"][sev] += 1
+
+    return sanitized
+
+
 def _build_analyst_prompt(
     extractions: list[ExtractionResult],
     schema: dict,
@@ -489,6 +547,10 @@ def _build_analyst_prompt(
 
     The agent spec (analyst.md) is sent as the system prompt separately.
     This returns only the task portion — request context and extraction data.
+
+    SECURITY: Raw web content is stripped from extractions before inclusion.
+    The analyst sees field values and anomaly metadata, never source text
+    or anomaly descriptions that could contain injection payloads.
     """
     safe_topic = _sanitize_for_prompt(topic)
 
@@ -497,7 +559,7 @@ def _build_analyst_prompt(
         extraction_data.append({
             "source_number": i,
             "source_url": ext.source.url,
-            "extraction": ext.extraction,
+            "extraction": _sanitize_extraction_for_analyst(ext.extraction),
             "schema_validation": ext.validation.to_dict(),
         })
 
@@ -542,16 +604,16 @@ def _build_result_from_single_extraction(
 
     overall_confidence = max(0.0, min(1.0, base_confidence + single_source_penalty))
 
-    # Anomaly assessment
+    # Anomaly assessment — only expose type + severity to caller, never descriptions
+    # (descriptions may contain raw web content / injection payloads)
     anomaly_counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
     anomaly_patterns = []
     for a in anomaly_log:
         sev = a.get("severity", "low")
         if sev in anomaly_counts:
             anomaly_counts[sev] += 1
-        # Sanitize the pattern description — don't pass raw web content to caller
-        desc = a.get("description", "")[:150]
-        anomaly_patterns.append(f"Source 1: {a.get('type', 'unknown')} — {desc}")
+        atype = a.get("type", "unknown")
+        anomaly_patterns.append(f"Source 1: {atype} [{sev}]")
         # Apply confidence penalty for anomalies
         if sev == "high":
             overall_confidence = max(0.0, overall_confidence - 0.1)
@@ -801,8 +863,8 @@ async def validate_and_crossref(
 
     try:
         analyst_output = _parse_json_from_text(text)
-    except (json.JSONDecodeError, ValueError) as e:
-        raise ExtractionError(f"Analyst agent returned invalid JSON: {e}")
+    except (json.JSONDecodeError, ValueError):
+        raise ExtractionError("Analyst agent returned invalid JSON")
 
     if "validation" not in analyst_output:
         raise ExtractionError(
