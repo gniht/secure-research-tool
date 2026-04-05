@@ -324,13 +324,14 @@ def _sanitize_for_prompt(text: str, max_length: int = 500) -> str:
 
 
 def _build_researcher_prompt(sanitized_text: str, schema: dict, topic: str) -> str:
-    """Build the prompt for the researcher agent."""
-    agent_spec = (_PROJECT_DIR / "agents" / "researcher.md").read_text()
+    """Build the user message for the researcher agent.
+
+    The agent spec (researcher.md) is sent as the system prompt separately.
+    This returns only the task portion — topic, schema, and source text.
+    """
     safe_topic = _sanitize_for_prompt(topic)
 
     return (
-        f"{agent_spec}\n\n"
-        f"---\n\n"
         f"## Your Current Task\n\n"
         f"**Topic:** {safe_topic}\n\n"
         f"**Domain Schema:**\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
@@ -349,15 +350,51 @@ async def extract_from_source(
     Stage 2 — isolated AI. The agent can only read the provided text
     and output structured JSON. No tools, no web, no project access.
 
+    Security boundary: the agent spec is the system prompt (trusted),
+    the source text is in the user message (untrusted). No tools are
+    provided, so the model cannot take actions beyond generating text.
+
     Returns the extraction JSON matching the researcher agent's output format.
     """
-    # TODO: Implement Claude API invocation
-    # prompt = _build_researcher_prompt(sanitized.sanitized_text, schema, topic)
-    # Call Claude with the prompt, parse JSON response
-    raise NotImplementedError(
-        "Researcher agent invocation not yet implemented. "
-        "Needs Anthropic SDK to call Claude."
+    client = anthropic.AsyncAnthropic()
+
+    agent_spec = (_PROJECT_DIR / "agents" / "researcher.md").read_text()
+    user_message = _build_researcher_prompt(
+        sanitized.sanitized_text, schema, topic
     )
+
+    response = await client.messages.create(
+        model=EXTRACT_MODEL,
+        max_tokens=4096,
+        system=agent_spec,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    # Extract text from response
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    if not text.strip():
+        raise ExtractionError(
+            f"Researcher agent returned empty response for {sanitized.url}"
+        )
+
+    try:
+        extraction = _parse_json_from_text(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ExtractionError(
+            f"Researcher agent returned invalid JSON for {sanitized.url}: {e}"
+        )
+
+    # Structural check — extraction key is required for downstream processing
+    if "extraction" not in extraction:
+        raise ExtractionError(
+            f"Researcher output missing 'extraction' key for {sanitized.url}"
+        )
+
+    return extraction
 
 
 # --- Stage 3: Validate & Cross-reference ---
@@ -370,8 +407,11 @@ def _build_analyst_prompt(
     request_id: str,
     trust_level: str,
 ) -> str:
-    """Build the prompt for the analyst agent."""
-    agent_spec = (_PROJECT_DIR / "agents" / "analyst.md").read_text()
+    """Build the user message for the analyst agent.
+
+    The agent spec (analyst.md) is sent as the system prompt separately.
+    This returns only the task portion — request context and extraction data.
+    """
     safe_topic = _sanitize_for_prompt(topic)
 
     extraction_data = []
@@ -384,8 +424,6 @@ def _build_analyst_prompt(
         })
 
     return (
-        f"{agent_spec}\n\n"
-        f"---\n\n"
         f"## Your Current Task\n\n"
         f"**Request ID:** {request_id}\n"
         f"**Topic:** {safe_topic}\n"
@@ -507,6 +545,139 @@ def _build_result_from_single_extraction(
     }
 
 
+def _build_result_from_analyst(
+    analyst_output: dict,
+    extractions: list[ExtractionResult],
+    schema: dict,
+    request_id: str,
+    topic: str,
+    trust_level: str,
+) -> dict:
+    """Transform the analyst agent's output into the MCP return format."""
+    validation = analyst_output.get("validation", {})
+    consensus = validation.get("consensus_data", {})
+    missing = validation.get("fields_missing", {})
+    cross_report = validation.get("cross_source_report", {})
+    anomaly_info = validation.get("anomaly_summary", {})
+
+    # Extract flat data and field details from consensus
+    data = {}
+    field_details = {}
+    for name, info in consensus.items():
+        data[name] = info.get("value")
+        field_details[name] = {
+            "value": info.get("value"),
+            "confidence": info.get("confidence", 0.0),
+            "source_agreement": info.get("source_agreement", "unknown"),
+            "notes": info.get("notes"),
+        }
+
+    # Overall confidence from cross-source agreement
+    overall_agreement = cross_report.get("overall_agreement", 0.5)
+
+    # Average field confidence as overall, weighted by agreement
+    if field_details:
+        field_confidences = [f["confidence"] for f in field_details.values()]
+        overall_confidence = sum(field_confidences) / len(field_confidences)
+    else:
+        overall_confidence = 0.0
+
+    # Determine status — analyst provides one, but we enforce trust level rules
+    analyst_status = validation.get("status", "partial")
+    analyst_recommendation = anomaly_info.get("recommendation", "review")
+
+    source_count = len(extractions)
+    all_schema_valid = all(ext.validation.valid for ext in extractions)
+
+    critical_count = anomaly_info.get("critical_anomalies", 0)
+    high_count = anomaly_info.get("high_anomalies", 0)
+
+    if trust_level == "strict":
+        if source_count < 3:
+            status = "rejected"
+        elif critical_count > 0 or analyst_recommendation == "reject":
+            status = "rejected"
+        elif high_count > 0 or not all_schema_valid or overall_agreement < 0.7:
+            status = "partial"
+        else:
+            status = "validated"
+    elif trust_level == "standard":
+        if critical_count > 0 or analyst_recommendation == "reject":
+            status = "rejected"
+        elif high_count > 0 or not all_schema_valid:
+            status = "partial"
+        else:
+            status = analyst_status
+    else:  # exploratory
+        if critical_count > 0:
+            status = "rejected"
+        elif not all_schema_valid:
+            status = "partial"
+        else:
+            status = analyst_status
+
+    # Check for missing required fields
+    missing_field_names = list(missing.keys())
+    missing_required = [
+        fname for fname in missing_field_names
+        if schema.get("fields", {}).get(fname, {}).get("required")
+    ]
+    if missing_required and status == "validated":
+        status = "partial"
+
+    # Build anomaly summary
+    anomaly_patterns = anomaly_info.get("anomaly_patterns", [])
+    total_anomalies = anomaly_info.get("total_anomalies_across_sources", 0)
+
+    # Determine max severity
+    max_severity = None
+    if critical_count > 0:
+        max_severity = "critical"
+    elif high_count > 0:
+        max_severity = "high"
+    elif total_anomalies > 0:
+        max_severity = "medium"
+
+    # Build sources list
+    sources = []
+    for ext in extractions:
+        sources.append({
+            "url": ext.source.url,
+            "fetch_date": ext.source.fetch_date,
+            "sanitization_warnings": ext.source.sanitize_result.warnings,
+        })
+
+    return {
+        "request_id": request_id,
+        "topic": topic,
+        "domain": schema.get("domain", ""),
+        "schema_id": schema.get("schema_id", ""),
+        "status": status,
+        "data": data,
+        "confidence": round(overall_confidence, 2),
+        "source_count": source_count,
+        "field_details": field_details,
+        "fields_missing": missing_field_names,
+        "sources": sources,
+        "quality_report": {
+            "schema_valid": all_schema_valid,
+            "cross_source_agreement": overall_agreement,
+            "anomaly_count": total_anomalies,
+            "anomaly_severity_max": max_severity,
+        },
+        "anomaly_summary": {
+            "total": total_anomalies,
+            "by_severity": {
+                "critical": critical_count,
+                "high": high_count,
+                "medium": total_anomalies - critical_count - high_count,
+                "low": 0,
+            },
+            "patterns": anomaly_patterns[:10],
+        },
+    }
+
+
 async def validate_and_crossref(
     extractions: list[ExtractionResult],
     schema: dict,
@@ -528,12 +699,40 @@ async def validate_and_crossref(
         )
 
     # Multiple extractions — invoke analyst agent for cross-referencing
-    # TODO: Implement analyst agent invocation
-    # prompt = _build_analyst_prompt(extractions, schema, topic, request_id, trust_level)
-    # Call Claude with the prompt, parse JSON response, build result dict
-    raise NotImplementedError(
-        "Multi-source cross-referencing not yet implemented. "
-        "Needs Anthropic SDK to invoke analyst agent."
+    client = anthropic.AsyncAnthropic()
+
+    agent_spec = (_PROJECT_DIR / "agents" / "analyst.md").read_text()
+    user_message = _build_analyst_prompt(
+        extractions, schema, topic, request_id, trust_level
+    )
+
+    response = await client.messages.create(
+        model=ANALYST_MODEL,
+        max_tokens=4096,
+        system=agent_spec,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    if not text.strip():
+        raise ExtractionError("Analyst agent returned empty response")
+
+    try:
+        analyst_output = _parse_json_from_text(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ExtractionError(f"Analyst agent returned invalid JSON: {e}")
+
+    if "validation" not in analyst_output:
+        raise ExtractionError(
+            "Analyst output missing 'validation' key"
+        )
+
+    return _build_result_from_analyst(
+        analyst_output, extractions, schema, request_id, topic, trust_level
     )
 
 

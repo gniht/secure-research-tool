@@ -12,17 +12,17 @@
   - Wired through existing `sanitizer.py`
   - User-provided URLs supported via `--url` flag / `urls` parameter
 
-- [ ] **Stage 2: Researcher agent invocation** — `pipeline.py:extract_from_source()`
+- [x] **Stage 2: Researcher agent invocation** — `pipeline.py:extract_from_source()`
   - Call Claude API (Opus) with researcher prompt
-  - Prompt construction already done (`_build_researcher_prompt()`)
+  - Agent spec as system prompt, source text in user message (security boundary)
   - Parse JSON response, handle malformed output
-  - Enforce no-tools / no-web constraint via API parameters
+  - No tools passed — enforces isolation constraint
 
-- [ ] **Stage 3: Analyst cross-referencing** — `pipeline.py:validate_and_crossref()` (multi-source path)
+- [x] **Stage 3: Analyst cross-referencing** — `pipeline.py:validate_and_crossref()` (multi-source path)
   - Call Claude API (Opus) with analyst prompt for 2+ extractions
-  - Prompt construction already done (`_build_analyst_prompt()`)
-  - Transform analyst output into the MCP return format
-  - Single-source path already implemented
+  - Agent spec as system prompt, extraction data in user message
+  - `_build_result_from_analyst()` transforms output into MCP return format
+  - Trust level enforcement applied on top of analyst's recommendation
 
 ## Testing
 
