@@ -8,19 +8,27 @@ General-purpose pipeline for AI-driven extraction of structured data from untrus
 
 Three-stage pipeline with strict isolation between stages:
 
-1. **Stage 1: Fetch & Sanitize** (no AI) — fetches web content, strips HTML, sanitizes text, saves to `staging/raw/`
-2. **Stage 2: Extract** (isolated AI) — researcher agent reads sanitized text, extracts structured data against the caller-provided schema, logs anomalies. Writes to `staging/extracted/`
-3. **Stage 3: Validate** (no AI + analyst AI) — schema validation (code), then analyst agent cross-references multiple extractions. Writes to `staging/validated/`
+1. **Stage 1: Fetch & Sanitize** (search agent + no AI) — search agent (Sonnet) discovers URLs via DuckDuckGo, then deterministic code fetches pages, strips HTML, sanitizes text, detects injection patterns
+2. **Stage 2: Extract** (isolated AI) — researcher agent (Opus) reads sanitized text, extracts structured data against the caller-provided schema, logs anomalies via behavioral audit. No tools provided — can only generate text.
+3. **Stage 3: Validate** (deterministic + analyst AI) — schema validation (code), sanitizer-AI cross-check (deterministic severity floor), then analyst agent (Opus) cross-references multiple extractions. Analyst never sees raw web content — only field values and anomaly metadata.
 
-**Key security property:** No single stage has both access to untrusted web content AND the ability to affect the calling project.
+**Key security properties:**
+- No single stage has both access to untrusted web content AND the ability to affect the calling project
+- Agent specs go in system prompts (trusted), untrusted content goes in user messages
+- Sanitizer floor: if the sanitizer detected injection patterns but the researcher didn't flag them, the pipeline injects deterministic anomalies (can't be suppressed by a compromised agent)
+- Analyst isolation: raw web content (anomaly descriptions, source excerpts, field_sources) is stripped before reaching the analyst, preventing second-stage injection
 
 ## Project Structure
 
 ```
 secure-research-tool/
+  mcp_server.py            # MCP server — primary interface (secure_research + validate_research_schema tools)
+  pipeline.py              # Core pipeline orchestrator (all three stages)
+  cli.py                   # CLI for debugging (calls same pipeline)
   agents/
-    researcher.md          # Stage 2 agent specification
-    analyst.md             # Stage 3 analyst agent specification
+    search.md              # Stage 1 search agent specification (Sonnet)
+    researcher.md          # Stage 2 extraction agent specification (Opus)
+    analyst.md             # Stage 3 analyst agent specification (Opus)
   schemas/
     example_schema.json    # Example showing the schema format callers should follow
   validation/
@@ -32,12 +40,17 @@ secure-research-tool/
     validated/             # Stage 3 output: validated, cross-referenced results
   docs/
     design.md              # Full design document
-  cli.py                   # CLI entry point
 ```
 
 ## Usage
 
-Callers provide their own domain schemas. The `--schema` parameter points to a JSON file the caller creates for their specific use case.
+**Primary interface: MCP server.** Configured in `~/.claude/.mcp.json` for use as a tool by Claude Code or other MCP clients. Callers provide domain schemas inline as JSON — no file paths, no shared filesystem coupling.
+
+The MCP server exposes two tools:
+- `secure_research` — full pipeline: search → fetch → sanitize → extract → validate → return
+- `validate_research_schema` — check a schema before using it
+
+**CLI (debugging only):**
 
 ```bash
 # Create a research request (caller provides their schema)

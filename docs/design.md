@@ -15,21 +15,22 @@ The core tension: we need AI to interpret and extract structured data from unstr
 Three stages with strict boundaries between them. No single stage has both access to untrusted content AND the ability to affect the calling project.
 
 ```
-Stage 1: Fetch (no AI)         Stage 2: Extract (isolated AI)     Stage 3: Validate (no AI)
-─────────────────────         ──────────────────────────────     ─────────────────────────
-- Fetches web pages           - Reads raw text files              - Schema validation
-- Strips to plain text        - Extracts against domain schema    - Range/plausibility checks
-- Saves to staging/raw/       - Logs anomalies & impulses         - Cross-source comparison
-- No interpretation           - Writes to staging/extracted/      - Anomaly severity scoring
-- No AI involved              - No project access                 - Writes to staging/validated/
-                              - No shell commands                 - No AI involved
-                              - No web access
+Stage 1: Fetch & Sanitize          Stage 2: Extract (isolated AI)     Stage 3: Validate & Cross-ref
+──────────────────────────         ──────────────────────────────     ─────────────────────────────
+- Search agent (Sonnet)            - Researcher agent (Opus)          - Schema validation (code)
+  discovers URLs via DuckDuckGo    - Reads sanitized text only        - Sanitizer-AI cross-check (code)
+- Fetches web pages (httpx)        - Extracts against domain schema   - Analyst agent (Opus) for 2+ sources
+- Strips HTML, sanitizes text      - Behavioral audit + anomaly log   - Analyst sees field values only —
+- Detects injection patterns       - No tools, no web, no project       raw web content stripped
+- No interpretation of content     - Agent spec = system prompt       - Trust level enforcement (code)
+                                   - Source text = user message
 ```
 
 **Key security properties:**
-- Stage 1 can't be injected (no AI)
+- Stage 1 can't be injected (no AI in fetch/sanitize; search agent only constructs queries)
 - Stage 2 can be injected but can't act on it (no tools, rigid output schema, anomaly logging)
-- Stage 3 can't be injected (no AI, no web content) and catches structural corruption
+- Sanitizer floor: deterministic code cross-checks sanitizer findings against researcher's anomaly log — a compromised agent can't suppress what the sanitizer already detected
+- Stage 3 analyst never sees raw web content (anomaly descriptions, source excerpts, field_sources stripped before analyst prompt)
 - No stage has both web access AND project write access
 
 ## 3. Threat Model
@@ -94,15 +95,28 @@ The calling project submits a research request:
     }
   ],
 
+  "field_details": {
+    "slot_count": {
+      "value": 32,
+      "confidence": 0.8,
+      "source_agreement": "all_agree",
+      "notes": null
+    }
+  },
+  "fields_missing": [],
+
   "quality_report": {
     "schema_valid": true,
-    "plausibility_valid": true,
     "cross_source_agreement": 0.9,
     "anomaly_count": 0,
     "anomaly_severity_max": null
   },
 
-  "anomalies": []
+  "anomaly_summary": {
+    "total": 0,
+    "by_severity": {"low": 0, "medium": 0, "high": 0, "critical": 0},
+    "patterns": []
+  }
 }
 ```
 
@@ -202,19 +216,18 @@ This is a deliberate design choice. Statefulness would require the tool to maint
 
 ## 9. Future Extensions
 
-- **MCP server integration** — expose as a Model Context Protocol tool that AI agents can call
 - **Source reputation API** — calling projects can share source quality data (opt-in)
 - **Batch mode** — process multiple topics in parallel with shared fetching
 - **Custom validation plugins** — callers provide domain-specific plausibility checks
 - **Anomaly pattern library** — known injection patterns for proactive detection
 
-## 10. Implementation Priorities
+## 10. What's Built
 
-1. Domain schema format + validation logic (Python)
-2. Stage 1: Fetch script (Python, no AI)
-3. Stage 2: Researcher agent specification (Claude agent prompt)
-4. Stage 2: Analyst agent specification (Claude agent prompt) — validates extractions
-5. Stage 3: Schema + plausibility validation (Python)
-6. CLI orchestrator that chains the stages
-7. Initial domain schemas for game system research
-8. End-to-end test with a known game
+All pipeline stages are implemented and wired up:
+- Stage 1: Search agent (Sonnet) + fetch/sanitize (httpx + sanitizer.py)
+- Stage 2: Researcher agent (Opus) with behavioral audit and anomaly logging
+- Stage 3: Schema validation (code) + sanitizer floor (code) + analyst agent (Opus) for multi-source
+- MCP server with `secure_research` and `validate_research_schema` tools
+- CLI for debugging
+
+Not yet built: unit tests, integration tests, adversarial tests (see TODO.md).
