@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Core pipeline for secure research tool.
 
@@ -18,7 +20,7 @@ from pathlib import Path
 
 import anthropic
 import httpx
-from duckduckgo_search import AsyncDDGS
+from duckduckgo_search import DDGS
 
 _PROJECT_DIR = Path(__file__).parent
 
@@ -138,10 +140,9 @@ def validate_caller_schema(schema: dict) -> ValidationResult:
 # --- Stage 1a: URL Discovery (search agent) ---
 
 
-async def _execute_web_search(query: str, max_results: int = 10) -> list[dict]:
+def _execute_web_search(query: str, max_results: int = 10) -> list[dict]:
     """Run a DuckDuckGo search. Returns list of {title, url, snippet}."""
-    async with AsyncDDGS() as ddgs:
-        results = await ddgs.atext(query, max_results=max_results)
+    results = DDGS().text(query, max_results=max_results)
     return [
         {"title": r["title"], "url": r["href"], "snippet": r["body"]}
         for r in results
@@ -217,7 +218,7 @@ async def discover_sources(
             for block in response.content:
                 if block.type == "tool_use" and block.name == "web_search":
                     try:
-                        results = await _execute_web_search(block.input["query"])
+                        results = _execute_web_search(block.input["query"])
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -394,6 +395,83 @@ async def extract_from_source(
             f"Researcher output missing 'extraction' key for {sanitized.url}"
         )
 
+    return extraction
+
+
+# --- Sanitizer-AI Cross-check ---
+
+
+def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
+    """Enforce a deterministic severity floor based on sanitizer findings.
+
+    If the sanitizer detected injection patterns, the researcher agent's
+    anomaly log must reflect at least that level of concern. The agent can
+    escalate above the floor but cannot downplay or omit what the sanitizer
+    found. This prevents a successful prompt injection from silencing its
+    own detection.
+
+    Rules:
+    - Sanitizer found patterns + researcher flagged high/critical → no change
+    - Sanitizer found patterns + researcher flagged low/medium → inject "high"
+    - Sanitizer found patterns + researcher logged nothing → inject "critical"
+    - Sanitizer found nothing → no change (AI judgment stands alone)
+    """
+    patterns = source.sanitize_result.patterns_detected
+    if not patterns:
+        return extraction
+
+    anomaly_log = extraction.get("anomaly_log", [])
+
+    # Check whether the researcher acknowledged the injection patterns
+    # at an appropriate severity
+    has_high_or_critical = any(
+        a.get("type") in ("instruction_detected", "suspicious_formatting")
+        and a.get("severity") in ("high", "critical")
+        for a in anomaly_log
+    )
+
+    if has_high_or_critical:
+        return extraction
+
+    # Researcher didn't flag at appropriate severity — enforce floor
+    extraction = dict(extraction)  # shallow copy to avoid mutating caller's data
+    anomaly_log = list(anomaly_log)
+
+    has_any_acknowledgment = any(
+        a.get("type") in ("instruction_detected", "suspicious_formatting")
+        for a in anomaly_log
+    )
+
+    if has_any_acknowledgment:
+        # Researcher noticed but downplayed — floor at "high"
+        anomaly_log.append({
+            "type": "instruction_detected",
+            "severity": "high",
+            "description": (
+                f"PIPELINE: Sanitizer detected {len(patterns)} injection pattern(s). "
+                "Researcher acknowledged but classified below 'high'. "
+                "Severity floor enforced."
+            ),
+            "source_excerpt": None,
+            "impulse_description": None,
+            "action_taken": "Deterministic severity floor applied by pipeline",
+        })
+    else:
+        # Researcher didn't flag at all — possible compromise
+        anomaly_log.append({
+            "type": "instruction_detected",
+            "severity": "critical",
+            "description": (
+                f"PIPELINE: Sanitizer detected {len(patterns)} injection pattern(s) "
+                "but researcher agent logged no corresponding anomalies. "
+                "Possible agent compromise."
+            ),
+            "source_excerpt": None,
+            "impulse_description": None,
+            "action_taken": "Deterministic severity floor applied by pipeline",
+        })
+
+    extraction["anomaly_log"] = anomaly_log
     return extraction
 
 
@@ -804,11 +882,12 @@ async def execute_research(
         *extraction_tasks, return_exceptions=True
     )
 
-    # Pair results with sources, run schema validation on each
+    # Pair results with sources, enforce sanitizer floor, run schema validation
     extractions = []
     for source, raw in zip(sources, raw_extractions):
         if isinstance(raw, Exception):
             continue  # Skip failed extractions
+        raw = _apply_sanitizer_floor(source, raw)
         validation = validate_extraction(raw, schema)
         extractions.append(ExtractionResult(
             source=source,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Secure Research Tool — MCP Server.
 
@@ -14,7 +16,7 @@ from pipeline import execute_research, validate_caller_schema
 
 mcp = FastMCP(
     "secure-research-tool",
-    description=(
+    instructions=(
         "Secure pipeline for extracting structured data from untrusted web sources. "
         "Handles fetching, sanitization, AI extraction, and multi-source validation "
         "with built-in prompt injection detection."
