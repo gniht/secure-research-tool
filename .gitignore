@@ -6,6 +6,9 @@ staging/validated/*
 !staging/extracted/.gitkeep
 !staging/validated/.gitkeep
 
+# Secrets
+.env
+
 # Python
 __pycache__/
 *.py[cod]

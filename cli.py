@@ -20,7 +20,7 @@ from pathlib import Path
 
 from validation.schema_validator import load_schema, validate_extraction
 from validation.sanitizer import sanitize
-from pipeline import execute_research, validate_caller_schema, SchemaError
+from pipeline import validate_caller_schema, SchemaError
 
 
 STAGING_DIR = Path("staging")
@@ -36,55 +36,20 @@ def ensure_dirs():
 
 
 def cmd_research(args):
-    """Handle the 'research' command — run the full pipeline."""
-    ensure_dirs()
-
-    schema = load_schema(Path(args.schema))
-
-    user_urls = args.url if args.url else None
-
-    print(f"Starting research pipeline...")
-    print(f"  Topic: {args.topic}")
-    print(f"  Domain: {schema['domain']}")
-    print(f"  Schema: {schema['schema_id']}")
-    print(f"  Trust level: {args.trust_level}")
-    print(f"  Max sources: {args.max_sources}")
-    if user_urls:
-        print(f"  URLs provided: {len(user_urls)}")
+    """Handle the 'research' command — now requires Claude Code for AI stages."""
+    print("The 'research' command requires AI stages that are now handled by")
+    print("Claude Code subagents, not the CLI directly.")
     print()
-
-    try:
-        result = asyncio.run(execute_research(
-            topic=args.topic,
-            schema=schema,
-            trust_level=args.trust_level,
-            max_sources=args.max_sources,
-            urls=user_urls,
-        ))
-    except SchemaError as e:
-        print(f"Schema error: {e}")
-        sys.exit(1)
-    except NotImplementedError as e:
-        print(f"Not yet implemented: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Pipeline error: {e}")
-        sys.exit(1)
-
-    # Save result
-    output_path = VALIDATED_DIR / f"result_{result['request_id'][:8]}.json"
-    with open(output_path, "w") as f:
-        json.dump(result, f, indent=2)
-
-    print(f"Status: {result['status']}")
-    print(f"Confidence: {result['confidence']}")
-    print(f"Sources: {result['source_count']}")
-    print(f"Result saved: {output_path}")
-
-    if result.get("anomaly_summary", {}).get("total", 0) > 0:
-        print(f"Anomalies: {result['anomaly_summary']['total']}")
-
-    sys.exit(0 if result["status"] == "validated" else 1)
+    print("Use the MCP server tools from within Claude Code instead:")
+    print("  1. search_web() to find sources")
+    print("  2. fetch_and_sanitize() to get sanitized content")
+    print("  3. Spawn extraction subagent with get_agent_spec('researcher')")
+    print("  4. validate_extraction() + apply_sanitizer_floor()")
+    print("  5. build_result_single() or build_result_multi()")
+    print()
+    print("For standalone CLI usage, use the 'sanitize', 'validate', and")
+    print("'check-schema' commands which remain fully functional.")
+    sys.exit(1)
 
 
 def cmd_sanitize(args):

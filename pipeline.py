@@ -4,10 +4,16 @@ from __future__ import annotations
 """
 Core pipeline for secure research tool.
 
-Orchestrates the three-stage research pipeline:
-  Stage 1: Fetch & sanitize (no AI)
-  Stage 2: Extract via researcher agent (isolated AI)
-  Stage 3: Validate & cross-reference (deterministic + analyst AI)
+Provides deterministic stages of the research pipeline:
+  - Web search (DuckDuckGo)
+  - Fetch & sanitize (HTTP + HTML stripping + injection detection)
+  - Schema validation (structural checks on extraction JSON)
+  - Sanitizer floor enforcement (deterministic severity override)
+  - Result building (confidence scoring, status determination)
+
+AI stages (extraction and cross-source analysis) are handled by the
+calling agent (Claude Code) via isolated subagents. This module provides
+the security infrastructure around those AI calls.
 """
 
 import asyncio
@@ -18,7 +24,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
 import httpx
 from duckduckgo_search import DDGS
 
@@ -26,13 +31,6 @@ _PROJECT_DIR = Path(__file__).parent
 
 from validation.sanitizer import sanitize, SanitizeResult
 from validation.schema_validator import validate_extraction, ValidationResult
-
-
-# --- Model Configuration ---
-
-SEARCH_MODEL = "claude-sonnet-4-6"
-EXTRACT_MODEL = "claude-opus-4-6"
-ANALYST_MODEL = "claude-opus-4-6"
 
 
 # --- Errors ---
@@ -51,31 +49,6 @@ class SchemaError(ResearchError):
 class FetchError(ResearchError):
     """No sources could be fetched."""
     pass
-
-
-class ExtractionError(ResearchError):
-    """AI extraction stage failed."""
-    pass
-
-
-# --- Data Classes ---
-
-
-@dataclass
-class SanitizedSource:
-    """Result of fetching and sanitizing a single web source."""
-    url: str
-    fetch_date: str
-    sanitized_text: str
-    sanitize_result: SanitizeResult
-
-
-@dataclass
-class ExtractionResult:
-    """Result of running the researcher agent on one source."""
-    source: SanitizedSource
-    extraction: dict
-    validation: ValidationResult
 
 
 # --- Schema Validation ---
@@ -137,10 +110,10 @@ def validate_caller_schema(schema: dict) -> ValidationResult:
     return result
 
 
-# --- Stage 1a: URL Discovery (search agent) ---
+# --- Web Search (DuckDuckGo, no AI) ---
 
 
-def _execute_web_search(query: str, max_results: int = 10) -> list[dict]:
+def execute_web_search(query: str, max_results: int = 10) -> list[dict]:
     """Run a DuckDuckGo search. Returns list of {title, url, snippet}."""
     results = DDGS().text(query, max_results=max_results)
     return [
@@ -149,142 +122,35 @@ def _execute_web_search(query: str, max_results: int = 10) -> list[dict]:
     ]
 
 
-def _parse_json_from_text(text: str) -> dict:
-    """Parse JSON from agent response text, stripping markdown code blocks if present."""
-    text = text.strip()
-    if text.startswith("```"):
-        # Strip code block markers
-        lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines)
-    return json.loads(text)
+# --- Fetch & Sanitize (no AI) ---
 
 
-async def discover_sources(
-    topic: str,
-    max_sources: int,
-    source_hints: list[str] | None = None,
-) -> list[str]:
-    """
-    Use the search agent to find relevant URLs for a topic.
-
-    The search agent (Sonnet) constructs search queries, evaluates results
-    via DuckDuckGo, and returns the most relevant URLs.
-    """
-    client = anthropic.AsyncAnthropic()
-
-    search_tool = {
-        "name": "web_search",
-        "description": (
-            "Search the web for pages relevant to the research topic. "
-            "Returns a list of results with title, URL, and snippet."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to execute",
-                }
-            },
-            "required": ["query"],
-        },
-    }
-
-    agent_spec = (_PROJECT_DIR / "agents" / "search.md").read_text()
-    safe_topic = _sanitize_for_prompt(topic)
-
-    user_message = f"**Topic:** {safe_topic}\n"
-    if source_hints:
-        user_message += f"**Source hints:** {', '.join(source_hints)}\n"
-    user_message += f"**Max URLs to return:** {max_sources}\n"
-
-    messages = [{"role": "user", "content": user_message}]
-
-    # Tool use loop — agent calls web_search, we execute it, repeat until done
-    while True:
-        response = await client.messages.create(
-            model=SEARCH_MODEL,
-            max_tokens=1024,
-            system=agent_spec,
-            tools=[search_tool],
-            messages=messages,
-        )
-
-        if response.stop_reason == "tool_use":
-            # Execute each tool call
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use" and block.name == "web_search":
-                    try:
-                        results = _execute_web_search(block.input["query"])
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(results),
-                        })
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps({"error": str(e)}),
-                            "is_error": True,
-                        })
-
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            # Agent is done — extract JSON from final response
-            break
-
-    # Parse the agent's final response
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    try:
-        result = _parse_json_from_text(text)
-    except (json.JSONDecodeError, ValueError):
-        raise FetchError("Search agent returned invalid JSON")
-
-    # Extract and validate URLs
-    urls = []
-    seen = set()
-    for entry in result.get("urls", []):
-        url = entry.get("url", "")
-        if url.startswith(("http://", "https://")) and url not in seen:
-            urls.append(url)
-            seen.add(url)
-
-    return urls[:max_sources]
-
-
-# --- Stage 1b: Fetch & Sanitize (no AI) ---
-
-
-async def _fetch_single(client: httpx.AsyncClient, url: str) -> SanitizedSource:
-    """Fetch a single URL and sanitize its content."""
+async def _fetch_single(client: httpx.AsyncClient, url: str) -> dict:
+    """Fetch a single URL and sanitize its content. Returns a plain dict."""
     response = await client.get(url)
     response.raise_for_status()
 
     sanitize_result = sanitize(response.text)
 
-    return SanitizedSource(
-        url=url,
-        fetch_date=datetime.now(timezone.utc).isoformat(),
-        sanitized_text=sanitize_result.text,
-        sanitize_result=sanitize_result,
-    )
+    return {
+        "url": url,
+        "fetch_date": datetime.now(timezone.utc).isoformat(),
+        "sanitized_text": sanitize_result.text,
+        "original_length": sanitize_result.original_length,
+        "sanitized_length": sanitize_result.sanitized_length,
+        "truncated": sanitize_result.truncated,
+        "injection_patterns": sanitize_result.patterns_detected,
+        "warnings": sanitize_result.warnings,
+    }
 
 
-async def fetch_and_sanitize(urls: list[str]) -> list[SanitizedSource]:
+async def fetch_and_sanitize(urls: list[str]) -> list[dict]:
     """
     Fetch web pages at the given URLs and sanitize each one.
 
     No AI involved — pure HTTP fetching + deterministic sanitization.
-    Failed fetches are skipped gracefully.
+    Failed fetches are skipped gracefully with error info.
+    Returns list of dicts with sanitized text and metadata.
     """
     async with httpx.AsyncClient(
         timeout=10.0,
@@ -295,113 +161,33 @@ async def fetch_and_sanitize(urls: list[str]) -> list[SanitizedSource]:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     sources = []
-    for result in results:
-        if not isinstance(result, Exception):
+    errors = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            errors.append({"url": urls[i], "error": str(result)})
+        else:
             sources.append(result)
 
-    return sources
+    return {"sources": sources, "errors": errors}
 
 
 # --- Prompt Safety ---
 
 
 def _sanitize_for_prompt(text: str, max_length: int = 500) -> str:
-    """Sanitize a caller-provided string before embedding it in an agent prompt.
-
-    Prevents the topic or other caller strings from breaking the prompt
-    structure via markdown formatting or injection-like patterns.
-    """
+    """Sanitize a caller-provided string before embedding it in an agent prompt."""
     text = text[:max_length]
-    # Strip markdown structure characters that could alter prompt sections
     text = re.sub(r"^#{1,6}\s", "", text, flags=re.MULTILINE)
     text = text.replace("---", "").replace("```", "")
-    # Strip patterns that look like system/instruction markers
     text = re.sub(r"</?system[^>]*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\[/?system\]", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
-# --- Stage 2: Extract ---
-
-
-def _build_researcher_prompt(sanitized_text: str, schema: dict, topic: str) -> str:
-    """Build the user message for the researcher agent.
-
-    The agent spec (researcher.md) is sent as the system prompt separately.
-    This returns only the task portion — topic, schema, and source text.
-    """
-    safe_topic = _sanitize_for_prompt(topic)
-
-    return (
-        f"## Your Current Task\n\n"
-        f"**Topic:** {safe_topic}\n\n"
-        f"**Domain Schema:**\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-        f"**Source Text:**\n\n{sanitized_text}\n"
-    )
-
-
-async def extract_from_source(
-    sanitized: SanitizedSource,
-    schema: dict,
-    topic: str,
-) -> dict:
-    """
-    Invoke the researcher agent on one sanitized source.
-
-    Stage 2 — isolated AI. The agent can only read the provided text
-    and output structured JSON. No tools, no web, no project access.
-
-    Security boundary: the agent spec is the system prompt (trusted),
-    the source text is in the user message (untrusted). No tools are
-    provided, so the model cannot take actions beyond generating text.
-
-    Returns the extraction JSON matching the researcher agent's output format.
-    """
-    client = anthropic.AsyncAnthropic()
-
-    agent_spec = (_PROJECT_DIR / "agents" / "researcher.md").read_text()
-    user_message = _build_researcher_prompt(
-        sanitized.sanitized_text, schema, topic
-    )
-
-    response = await client.messages.create(
-        model=EXTRACT_MODEL,
-        max_tokens=4096,
-        system=agent_spec,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    # Extract text from response
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    if not text.strip():
-        raise ExtractionError(
-            f"Researcher agent returned empty response for {sanitized.url}"
-        )
-
-    try:
-        extraction = _parse_json_from_text(text)
-    except (json.JSONDecodeError, ValueError):
-        raise ExtractionError(
-            f"Researcher agent returned invalid JSON for {sanitized.url}"
-        )
-
-    # Structural check — extraction key is required for downstream processing
-    if "extraction" not in extraction:
-        raise ExtractionError(
-            f"Researcher output missing 'extraction' key for {sanitized.url}"
-        )
-
-    return extraction
-
-
 # --- Sanitizer-AI Cross-check ---
 
 
-def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
+def apply_sanitizer_floor(injection_patterns: list, extraction: dict) -> dict:
     """Enforce a deterministic severity floor based on sanitizer findings.
 
     If the sanitizer detected injection patterns, the researcher agent's
@@ -410,20 +196,18 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
     found. This prevents a successful prompt injection from silencing its
     own detection.
 
-    Rules:
-    - Sanitizer found patterns + researcher flagged high/critical → no change
-    - Sanitizer found patterns + researcher flagged low/medium → inject "high"
-    - Sanitizer found patterns + researcher logged nothing → inject "critical"
-    - Sanitizer found nothing → no change (AI judgment stands alone)
+    Args:
+        injection_patterns: patterns detected by the sanitizer for this source
+        extraction: the researcher agent's full output JSON
+
+    Returns:
+        The extraction dict, possibly with additional anomaly log entries.
     """
-    patterns = source.sanitize_result.patterns_detected
-    if not patterns:
+    if not injection_patterns:
         return extraction
 
     anomaly_log = extraction.get("anomaly_log", [])
 
-    # Check whether the researcher acknowledged the injection patterns
-    # at an appropriate severity
     has_high_or_critical = any(
         a.get("type") in ("instruction_detected", "suspicious_formatting")
         and a.get("severity") in ("high", "critical")
@@ -433,8 +217,7 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
     if has_high_or_critical:
         return extraction
 
-    # Researcher didn't flag at appropriate severity — enforce floor
-    extraction = dict(extraction)  # shallow copy to avoid mutating caller's data
+    extraction = dict(extraction)
     anomaly_log = list(anomaly_log)
 
     has_any_acknowledgment = any(
@@ -443,12 +226,11 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
     )
 
     if has_any_acknowledgment:
-        # Researcher noticed but downplayed — floor at "high"
         anomaly_log.append({
             "type": "instruction_detected",
             "severity": "high",
             "description": (
-                f"PIPELINE: Sanitizer detected {len(patterns)} injection pattern(s). "
+                f"PIPELINE: Sanitizer detected {len(injection_patterns)} injection pattern(s). "
                 "Researcher acknowledged but classified below 'high'. "
                 "Severity floor enforced."
             ),
@@ -457,12 +239,11 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
             "action_taken": "Deterministic severity floor applied by pipeline",
         })
     else:
-        # Researcher didn't flag at all — possible compromise
         anomaly_log.append({
             "type": "instruction_detected",
             "severity": "critical",
             "description": (
-                f"PIPELINE: Sanitizer detected {len(patterns)} injection pattern(s) "
+                f"PIPELINE: Sanitizer detected {len(injection_patterns)} injection pattern(s) "
                 "but researcher agent logged no corresponding anomalies. "
                 "Possible agent compromise."
             ),
@@ -475,29 +256,20 @@ def _apply_sanitizer_floor(source: SanitizedSource, extraction: dict) -> dict:
     return extraction
 
 
-# --- Stage 3: Validate & Cross-reference ---
+# --- Extraction Sanitization for Analyst ---
 
 
-def _sanitize_extraction_for_analyst(extraction: dict) -> dict:
+def sanitize_extraction_for_analyst(extraction: dict) -> dict:
     """Strip raw web content from an extraction before passing to the analyst.
 
-    The analyst should never see raw source text. It needs:
-    - The extracted field values (structured data the analyst compares)
+    The analyst should never see raw source text. This keeps:
+    - Extracted field values (what the analyst compares)
     - Which fields were/weren't found
-    - Anomaly metadata (type, severity, count) — but NOT descriptions
-      or source_excerpts, which contain raw web content and are a
-      second-stage injection vector.
-    - The behavioral audit output_check (structured booleans)
-
-    Explicitly excluded:
-    - field_sources: short quotes from raw web content
-    - extraction_notes: may reference source text
-    - anomaly_log descriptions/excerpts: raw web content
-    - behavioral_audit actions_declined: contains source_excerpt strings
+    - Anomaly metadata (type, severity, count) — NOT descriptions
+    - Behavioral audit structure (booleans)
     """
     sanitized = {}
 
-    # Extraction block: keep only field values and structural metadata
     if "extraction" in extraction:
         ext = extraction["extraction"]
         sanitized["extraction"] = {
@@ -508,7 +280,6 @@ def _sanitize_extraction_for_analyst(extraction: dict) -> dict:
             "fields_not_found": ext.get("fields_not_found", []),
         }
 
-    # Behavioral audit: keep as-is (structured booleans/lists, no raw content)
     if "behavioral_audit" in extraction:
         audit = extraction["behavioral_audit"]
         sanitized["behavioral_audit"] = {
@@ -517,7 +288,6 @@ def _sanitize_extraction_for_analyst(extraction: dict) -> dict:
             "output_check": audit.get("output_check", {}),
         }
 
-    # Anomaly log: strip descriptions and source excerpts, keep only metadata
     if "anomaly_log" in extraction:
         sanitized["anomaly_log_summary"] = {
             "count": len(extraction["anomaly_log"]),
@@ -536,62 +306,38 @@ def _sanitize_extraction_for_analyst(extraction: dict) -> dict:
     return sanitized
 
 
-def _build_analyst_prompt(
-    extractions: list[ExtractionResult],
+# --- Result Building (deterministic) ---
+
+
+def build_result_single(
+    extraction: dict,
+    validation_result: dict,
+    source_info: dict,
     schema: dict,
-    topic: str,
-    request_id: str,
-    trust_level: str,
-) -> str:
-    """Build the user message for the analyst agent.
-
-    The agent spec (analyst.md) is sent as the system prompt separately.
-    This returns only the task portion — request context and extraction data.
-
-    SECURITY: Raw web content is stripped from extractions before inclusion.
-    The analyst sees field values and anomaly metadata, never source text
-    or anomaly descriptions that could contain injection payloads.
-    """
-    safe_topic = _sanitize_for_prompt(topic)
-
-    extraction_data = []
-    for i, ext in enumerate(extractions, 1):
-        extraction_data.append({
-            "source_number": i,
-            "source_url": ext.source.url,
-            "extraction": _sanitize_extraction_for_analyst(ext.extraction),
-            "schema_validation": ext.validation.to_dict(),
-        })
-
-    return (
-        f"## Your Current Task\n\n"
-        f"**Request ID:** {request_id}\n"
-        f"**Topic:** {safe_topic}\n"
-        f"**Trust Level:** {trust_level}\n\n"
-        f"**Domain Schema:**\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-        f"**Extractions to Compare:**\n```json\n{json.dumps(extraction_data, indent=2)}\n```\n"
-    )
-
-
-def _build_result_from_single_extraction(
-    extraction: ExtractionResult,
-    schema: dict,
-    request_id: str,
     topic: str,
     trust_level: str,
 ) -> dict:
-    """Build result dict when there's only one extraction (no cross-referencing needed)."""
-    ext = extraction.extraction.get("extraction", {})
+    """Build result dict from a single extraction (no cross-referencing).
+
+    Args:
+        extraction: the researcher agent's full output JSON
+        validation_result: output of validate_extraction() as dict
+        source_info: {"url", "fetch_date", "warnings"} for the source
+        schema: the domain schema
+        topic: research topic string
+        trust_level: "strict" | "standard" | "exploratory"
+    """
+    request_id = str(uuid.uuid4())
+
+    ext = extraction.get("extraction", {})
     fields = ext.get("fields", {})
     field_sources = ext.get("field_sources", {})
     fields_not_found = ext.get("fields_not_found", [])
-    anomaly_log = extraction.extraction.get("anomaly_log", [])
+    anomaly_log = extraction.get("anomaly_log", [])
 
-    # Single-source confidence: base 0.5, no multi-source bonus, apply penalties
     base_confidence = 0.5
     single_source_penalty = -0.2
 
-    # Build field details with single-source confidence
     field_details = {}
     for name, value in fields.items():
         field_confidence = max(0.0, min(1.0, base_confidence + single_source_penalty))
@@ -604,8 +350,6 @@ def _build_result_from_single_extraction(
 
     overall_confidence = max(0.0, min(1.0, base_confidence + single_source_penalty))
 
-    # Anomaly assessment — only expose type + severity to caller, never descriptions
-    # (descriptions may contain raw web content / injection payloads)
     anomaly_counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
     anomaly_patterns = []
     for a in anomaly_log:
@@ -614,7 +358,6 @@ def _build_result_from_single_extraction(
             anomaly_counts[sev] += 1
         atype = a.get("type", "unknown")
         anomaly_patterns.append(f"Source 1: {atype} [{sev}]")
-        # Apply confidence penalty for anomalies
         if sev == "high":
             overall_confidence = max(0.0, overall_confidence - 0.1)
         elif sev == "critical":
@@ -627,24 +370,22 @@ def _build_result_from_single_extraction(
             max_severity = sev
             break
 
-    # Determine status based on trust level
+    schema_valid = validation_result.get("valid", False)
     status = "validated"
 
     if trust_level == "strict":
-        # Strict requires 3+ sources — single source always rejected
         status = "rejected"
     elif trust_level == "standard":
         if anomaly_counts["critical"] > 0:
             status = "rejected"
-        elif anomaly_counts["high"] > 0 or not extraction.validation.valid:
+        elif anomaly_counts["high"] > 0 or not schema_valid:
             status = "partial"
     elif trust_level == "exploratory":
         if anomaly_counts["critical"] > 0:
             status = "rejected"
-        elif not extraction.validation.valid:
+        elif not schema_valid:
             status = "partial"
 
-    # Check for missing required fields
     missing_required = []
     for fname, fspec in schema.get("fields", {}).items():
         if fspec.get("required") and fname not in fields:
@@ -652,7 +393,6 @@ def _build_result_from_single_extraction(
     if missing_required and status == "validated":
         status = "partial"
 
-    # Deduplicate fields_missing
     all_missing = list(dict.fromkeys(fields_not_found + missing_required))
 
     return {
@@ -666,13 +406,9 @@ def _build_result_from_single_extraction(
         "source_count": 1,
         "field_details": field_details,
         "fields_missing": all_missing,
-        "sources": [{
-            "url": extraction.source.url,
-            "fetch_date": extraction.source.fetch_date,
-            "sanitization_warnings": extraction.source.sanitize_result.warnings,
-        }],
+        "sources": [source_info],
         "quality_report": {
-            "schema_valid": extraction.validation.valid,
+            "schema_valid": schema_valid,
             "cross_source_agreement": None,
             "anomaly_count": total_anomalies,
             "anomaly_severity_max": max_severity,
@@ -685,22 +421,34 @@ def _build_result_from_single_extraction(
     }
 
 
-def _build_result_from_analyst(
+def build_result_multi(
     analyst_output: dict,
-    extractions: list[ExtractionResult],
+    extractions: list[dict],
+    validation_results: list[dict],
+    source_infos: list[dict],
     schema: dict,
-    request_id: str,
     topic: str,
     trust_level: str,
 ) -> dict:
-    """Transform the analyst agent's output into the MCP return format."""
+    """Build result dict from analyst agent output (multi-source cross-referencing).
+
+    Args:
+        analyst_output: the analyst agent's full output JSON
+        extractions: list of researcher agent outputs
+        validation_results: list of validate_extraction() results as dicts
+        source_infos: list of {"url", "fetch_date", "warnings"} per source
+        schema: the domain schema
+        topic: research topic string
+        trust_level: "strict" | "standard" | "exploratory"
+    """
+    request_id = str(uuid.uuid4())
+
     validation = analyst_output.get("validation", {})
     consensus = validation.get("consensus_data", {})
     missing = validation.get("fields_missing", {})
     cross_report = validation.get("cross_source_report", {})
     anomaly_info = validation.get("anomaly_summary", {})
 
-    # Extract flat data and field details from consensus
     data = {}
     field_details = {}
     for name, info in consensus.items():
@@ -712,22 +460,16 @@ def _build_result_from_analyst(
             "notes": info.get("notes"),
         }
 
-    # Overall confidence from cross-source agreement
     overall_agreement = cross_report.get("overall_agreement", 0.5)
 
-    # Average field confidence as overall, weighted by agreement
     if field_details:
         field_confidences = [f["confidence"] for f in field_details.values()]
         overall_confidence = sum(field_confidences) / len(field_confidences)
     else:
         overall_confidence = 0.0
 
-    # Determine status — analyst provides one, but we enforce trust level rules
-    analyst_status = validation.get("status", "partial")
-    analyst_recommendation = anomaly_info.get("recommendation", "review")
-
     source_count = len(extractions)
-    all_schema_valid = all(ext.validation.valid for ext in extractions)
+    all_schema_valid = all(v.get("valid", False) for v in validation_results)
 
     critical_count = anomaly_info.get("critical_anomalies", 0)
     high_count = anomaly_info.get("high_anomalies", 0)
@@ -735,28 +477,27 @@ def _build_result_from_analyst(
     if trust_level == "strict":
         if source_count < 3:
             status = "rejected"
-        elif critical_count > 0 or analyst_recommendation == "reject":
+        elif critical_count > 0 or anomaly_info.get("recommendation") == "reject":
             status = "rejected"
         elif high_count > 0 or not all_schema_valid or overall_agreement < 0.7:
             status = "partial"
         else:
             status = "validated"
     elif trust_level == "standard":
-        if critical_count > 0 or analyst_recommendation == "reject":
+        if critical_count > 0 or anomaly_info.get("recommendation") == "reject":
             status = "rejected"
         elif high_count > 0 or not all_schema_valid:
             status = "partial"
         else:
-            status = analyst_status
-    else:  # exploratory
+            status = validation.get("status", "partial")
+    else:
         if critical_count > 0:
             status = "rejected"
         elif not all_schema_valid:
             status = "partial"
         else:
-            status = analyst_status
+            status = validation.get("status", "partial")
 
-    # Check for missing required fields
     missing_field_names = list(missing.keys())
     missing_required = [
         fname for fname in missing_field_names
@@ -765,11 +506,9 @@ def _build_result_from_analyst(
     if missing_required and status == "validated":
         status = "partial"
 
-    # Build anomaly summary
     anomaly_patterns = anomaly_info.get("anomaly_patterns", [])
     total_anomalies = anomaly_info.get("total_anomalies_across_sources", 0)
 
-    # Determine max severity
     max_severity = None
     if critical_count > 0:
         max_severity = "critical"
@@ -777,15 +516,6 @@ def _build_result_from_analyst(
         max_severity = "high"
     elif total_anomalies > 0:
         max_severity = "medium"
-
-    # Build sources list
-    sources = []
-    for ext in extractions:
-        sources.append({
-            "url": ext.source.url,
-            "fetch_date": ext.source.fetch_date,
-            "sanitization_warnings": ext.source.sanitize_result.warnings,
-        })
 
     return {
         "request_id": request_id,
@@ -798,7 +528,7 @@ def _build_result_from_analyst(
         "source_count": source_count,
         "field_details": field_details,
         "fields_missing": missing_field_names,
-        "sources": sources,
+        "sources": source_infos,
         "quality_report": {
             "schema_valid": all_schema_valid,
             "cross_source_agreement": overall_agreement,
@@ -818,151 +548,28 @@ def _build_result_from_analyst(
     }
 
 
-async def validate_and_crossref(
-    extractions: list[ExtractionResult],
-    schema: dict,
-    trust_level: str,
-    request_id: str,
-    topic: str,
-) -> dict:
+# --- Agent Spec Loader ---
+
+
+def get_agent_spec(agent_name: str) -> str:
+    """Load an agent specification markdown file.
+
+    Available agents: 'researcher', 'analyst', 'search'
     """
-    Run schema validation and cross-reference multiple extractions.
-
-    For single extractions: deterministic validation only.
-    For 2+ extractions: also invokes the analyst agent for cross-referencing.
-
-    Returns the final result dict matching the MCP return format.
-    """
-    if len(extractions) == 1:
-        return _build_result_from_single_extraction(
-            extractions[0], schema, request_id, topic, trust_level
-        )
-
-    # Multiple extractions — invoke analyst agent for cross-referencing
-    client = anthropic.AsyncAnthropic()
-
-    agent_spec = (_PROJECT_DIR / "agents" / "analyst.md").read_text()
-    user_message = _build_analyst_prompt(
-        extractions, schema, topic, request_id, trust_level
-    )
-
-    response = await client.messages.create(
-        model=ANALYST_MODEL,
-        max_tokens=4096,
-        system=agent_spec,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    if not text.strip():
-        raise ExtractionError("Analyst agent returned empty response")
-
-    try:
-        analyst_output = _parse_json_from_text(text)
-    except (json.JSONDecodeError, ValueError):
-        raise ExtractionError("Analyst agent returned invalid JSON")
-
-    if "validation" not in analyst_output:
-        raise ExtractionError(
-            "Analyst output missing 'validation' key"
-        )
-
-    return _build_result_from_analyst(
-        analyst_output, extractions, schema, request_id, topic, trust_level
-    )
+    path = _PROJECT_DIR / "agents" / f"{agent_name}.md"
+    if not path.exists():
+        raise ValueError(f"Unknown agent: {agent_name}")
+    return path.read_text()
 
 
-# --- Main Orchestrator ---
+# --- JSON Parsing Utility ---
 
 
-async def execute_research(
-    topic: str,
-    schema: dict,
-    trust_level: str = "standard",
-    max_sources: int = 3,
-    source_hints: list[str] | None = None,
-    urls: list[str] | None = None,
-) -> dict:
-    """
-    Execute the full three-stage research pipeline.
-
-    Returns the validated result dict matching the MCP return format.
-    Raises ResearchError subclasses on failures.
-    """
-    VALID_TRUST_LEVELS = ("strict", "standard", "exploratory")
-    if trust_level not in VALID_TRUST_LEVELS:
-        raise ValueError(
-            f"Invalid trust_level '{trust_level}'. "
-            f"Must be one of: {', '.join(VALID_TRUST_LEVELS)}"
-        )
-
-    request_id = str(uuid.uuid4())
-
-    # Validate schema eagerly — fail fast before any fetching
-    schema_check = validate_caller_schema(schema)
-    if not schema_check.valid:
-        raise SchemaError(
-            f"Invalid schema: {'; '.join(schema_check.errors)}"
-        )
-
-    # Stage 1a: URL Discovery
-    all_urls = list(urls or [])
-    if len(all_urls) < max_sources:
-        remaining = max_sources - len(all_urls)
-        discovered = await discover_sources(
-            topic=topic,
-            source_hints=source_hints,
-            max_sources=remaining,
-        )
-        existing = set(all_urls)
-        for url in discovered:
-            if url not in existing:
-                all_urls.append(url)
-                existing.add(url)
-
-    if not all_urls:
-        raise FetchError(
-            "No URLs to fetch. Provide explicit URLs or a topic to search for."
-        )
-
-    # Stage 1b: Fetch & Sanitize
-    sources = await fetch_and_sanitize(all_urls)
-
-    if not sources:
-        raise FetchError("All fetch attempts failed")
-
-    # Stage 2: Extract (parallel across sources)
-    extraction_tasks = [
-        extract_from_source(source, schema, topic)
-        for source in sources
-    ]
-    raw_extractions = await asyncio.gather(
-        *extraction_tasks, return_exceptions=True
-    )
-
-    # Pair results with sources, enforce sanitizer floor, run schema validation
-    extractions = []
-    for source, raw in zip(sources, raw_extractions):
-        if isinstance(raw, Exception):
-            continue  # Skip failed extractions
-        raw = _apply_sanitizer_floor(source, raw)
-        validation = validate_extraction(raw, schema)
-        extractions.append(ExtractionResult(
-            source=source,
-            extraction=raw,
-            validation=validation,
-        ))
-
-    if not extractions:
-        raise ExtractionError("All extraction attempts failed")
-
-    # Stage 3: Validate & Cross-reference
-    result = await validate_and_crossref(
-        extractions, schema, trust_level, request_id, topic
-    )
-
-    return result
+def parse_json_from_text(text: str) -> dict:
+    """Parse JSON from agent response text, stripping markdown code blocks if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    return json.loads(text)
