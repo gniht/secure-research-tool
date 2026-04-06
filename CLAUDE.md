@@ -8,27 +8,37 @@ General-purpose pipeline for AI-driven extraction of structured data from untrus
 
 Three-stage pipeline with strict isolation between stages:
 
-1. **Stage 1: Fetch & Sanitize** (search agent + no AI) — search agent (Sonnet) discovers URLs via DuckDuckGo, then deterministic code fetches pages, strips HTML, sanitizes text, detects injection patterns
-2. **Stage 2: Extract** (isolated AI) — researcher agent (Opus) reads sanitized text, extracts structured data against the caller-provided schema, logs anomalies via behavioral audit. No tools provided — can only generate text.
-3. **Stage 3: Validate** (deterministic + analyst AI) — schema validation (code), sanitizer-AI cross-check (deterministic severity floor), then analyst agent (Opus) cross-references multiple extractions. Analyst never sees raw web content — only field values and anomaly metadata.
+1. **Stage 1: Fetch & Sanitize** (no AI) — deterministic code searches DuckDuckGo, fetches pages, strips HTML, sanitizes text, detects injection patterns
+2. **Stage 2: Extract** (isolated AI subagent) — researcher agent reads sanitized text, extracts structured data against the caller-provided schema, logs anomalies via behavioral audit. Runs as an isolated `claude -p` subprocess — no tools, no project context, no MCP access.
+3. **Stage 3: Validate** (deterministic + isolated AI subagent) — schema validation (code), sanitizer-AI cross-check (deterministic severity floor), then analyst agent cross-references multiple extractions. Analyst runs as an isolated `claude -p` subprocess and never sees raw web content — only field values and anomaly metadata.
 
 **Key security properties:**
 - No single stage has both access to untrusted web content AND the ability to affect the calling project
+- AI subagents run as separate processes via `claude -p` with no tools or project context
 - Agent specs go in system prompts (trusted), untrusted content goes in user messages
 - Sanitizer floor: if the sanitizer detected injection patterns but the researcher didn't flag them, the pipeline injects deterministic anomalies (can't be suppressed by a compromised agent)
 - Analyst isolation: raw web content (anomaly descriptions, source excerpts, field_sources) is stripped before reaching the analyst, preventing second-stage injection
+
+**Subagent isolation via `claude -p`:**
+- Each AI stage spawns a separate `claude -p` process
+- The process runs from `/tmp` to avoid picking up any project CLAUDE.md
+- System prompt = agent spec (trusted channel)
+- User message = sanitized content + schema (untrusted channel)
+- No `--tools`, no MCP servers, no filesystem access beyond what claude -p defaults to
+- Uses the caller's Max plan — no additional API costs
 
 ## Project Structure
 
 ```
 secure-research-tool/
-  mcp_server.py            # MCP server — primary interface (secure_research + validate_research_schema tools)
-  pipeline.py              # Core pipeline orchestrator (all three stages)
-  cli.py                   # CLI for debugging (calls same pipeline)
+  mcp_server.py            # MCP server — primary interface (secure_research + validate_research_schema)
+  pipeline.py              # Core pipeline (deterministic stages)
+  subagent.py              # Isolated AI subagent spawner (claude -p)
+  cli.py                   # CLI for debugging (deterministic commands only)
   agents/
-    search.md              # Stage 1 search agent specification (Sonnet)
-    researcher.md          # Stage 2 extraction agent specification (Opus)
-    analyst.md             # Stage 3 analyst agent specification (Opus)
+    search.md              # Search strategy spec (reference only)
+    researcher.md          # Stage 2 extraction agent specification
+    analyst.md             # Stage 3 analyst agent specification
   schemas/
     example_schema.json    # Example showing the schema format callers should follow
   validation/
@@ -44,28 +54,41 @@ secure-research-tool/
 
 ## Usage
 
-**Primary interface: MCP server.** Configured in `~/.claude/.mcp.json` for use as a tool by Claude Code or other MCP clients. Callers provide domain schemas inline as JSON — no file paths, no shared filesystem coupling.
+**Primary interface: MCP server.** Configured in the calling project's `.claude/.mcp.json`:
 
-The MCP server exposes two tools:
-- `secure_research` — full pipeline: search → fetch → sanitize → extract → validate → return
+```json
+{
+  "mcpServers": {
+    "secure-research-tool": {
+      "command": "/home/gniht/projects/secure-research-tool/.venv/bin/python",
+      "args": ["/home/gniht/projects/secure-research-tool/mcp_server.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+The MCP server exposes:
+- `secure_research` — full pipeline: search → fetch → sanitize → extract (subagent) → validate → cross-ref (subagent) → score → return
 - `validate_research_schema` — check a schema before using it
+- `search_web`, `fetch_and_sanitize`, `get_agent_spec` — exposed for debugging/manual use
 
 **CLI (debugging only):**
 
 ```bash
-# Create a research request (caller provides their schema)
-python cli.py research --topic "Valheim inventory system" --domain inventory --schema /path/to/callers/inventory_schema.json
-
 # Sanitize raw fetched content
 python cli.py sanitize --input raw_page.html
 
 # Validate an extraction against the caller's schema
 python cli.py validate --extraction staging/extracted/result.json --schema /path/to/callers/inventory_schema.json
+
+# Check a schema for validity
+python cli.py check-schema --schema /path/to/callers/inventory_schema.json
 ```
 
 ## Schema Format
 
-Callers define schemas as JSON files. See `schemas/example_schema.json` for the format. Required keys:
+Callers define schemas as JSON objects. See `schemas/example_schema.json` for the format. Required keys:
 
 - `schema_id` — unique identifier for this schema version
 - `version` — integer version number
@@ -79,11 +102,9 @@ Callers define schemas as JSON files. See `schemas/example_schema.json` for the 
   - `max_length` — (string type) maximum character count
   - `values` — (enum type) list of allowed values
 
-The schema serves dual purpose: it tells the extraction agent what to look for, and it tells the validator what to accept.
-
 ## Agent Specifications
 
-Agent prompts are in `agents/`. These are designed to be used with Claude (or compatible AI):
+Agent prompts are in `agents/`. These are loaded as system prompts for isolated `claude -p` subagents:
 - **researcher.md** — extraction agent that reads sanitized text and produces structured JSON with anomaly logging
 - **analyst.md** — validation agent that cross-references multiple extractions and produces consensus results
 
@@ -99,3 +120,4 @@ The agents are intentionally constrained:
 - **Staging is ephemeral** — `staging/` contents are working data, not versioned
 - **Agent specs are versioned** — changes to agent prompts should be tracked in git
 - **Stateless per invocation** — the tool doesn't remember previous runs
+- **Subagent isolation is critical** — never pass tools or project context to subagents

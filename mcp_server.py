@@ -4,24 +4,30 @@ from __future__ import annotations
 """
 Secure Research Tool — MCP Server.
 
-Exposes the deterministic stages of the research pipeline as MCP tools.
-AI stages (extraction, cross-source analysis) are handled by the calling
-agent via isolated subagents — this server provides the security
-infrastructure around those AI calls.
+Exposes a single `secure_research` tool that runs the full pipeline:
+  1. Search (DuckDuckGo)
+  2. Fetch & Sanitize (HTTP + HTML stripping + injection detection)
+  3. Extract (isolated subagent via `claude -p`)
+  4. Validate (schema validation + sanitizer floor)
+  5. Cross-reference (isolated analyst subagent, if 2+ sources)
+  6. Score & return
 
-Tools:
-  search_web          — DuckDuckGo search, returns URLs
-  fetch_and_sanitize  — HTTP fetch + sanitize + injection detection
-  validate_schema     — Pre-flight schema check
-  validate_extraction — Schema validation on extraction JSON
-  apply_sanitizer_floor — Enforce severity floor on anomaly log
-  sanitize_for_analyst  — Strip raw content from extraction for analyst
-  build_result_single   — Confidence scoring for single-source result
-  build_result_multi    — Confidence scoring for multi-source result
-  get_agent_spec        — Load agent spec (researcher/analyst) for subagent prompts
+Also exposes `validate_research_schema` for pre-flight schema checks,
+and the individual pipeline tools for manual/debugging use.
+
+Security model:
+  - AI stages run as isolated subagents (separate `claude -p` processes)
+  - Subagents have no tools, no project context, no MCP access
+  - Agent specs go in system prompts (trusted channel)
+  - Untrusted web content goes in user messages only
+  - Sanitizer floor: deterministic code cross-checks sanitizer findings
+    against researcher's anomaly log
+  - Analyst never sees raw web content
 """
 
+import asyncio
 import json
+import logging
 
 from mcp.server.fastmcp import FastMCP
 
@@ -34,32 +40,278 @@ from pipeline import (
     build_result_single as _build_result_single,
     build_result_multi as _build_result_multi,
     get_agent_spec as _get_agent_spec,
+    parse_json_from_text,
 )
 from validation.schema_validator import validate_extraction as _validate_extraction
+from subagent import run_researcher, run_analyst
+
+logger = logging.getLogger(__name__)
 
 
 mcp = FastMCP(
     "secure-research-tool",
     instructions=(
         "Secure pipeline for extracting structured data from untrusted web sources. "
-        "This server provides the deterministic stages: search, fetch, sanitize, "
-        "validate, and score. AI extraction and analysis are done by the calling "
-        "agent via isolated subagents using the agent specs from get_agent_spec()."
+        "Use `secure_research` for the full pipeline — it handles search, fetch, "
+        "sanitize, extract (via isolated subagent), validate, cross-reference, "
+        "and scoring automatically. Use `validate_research_schema` to check a "
+        "schema before using it."
     ),
 )
 
 
-# --- Tools ---
+# --- Primary Tool: Full Pipeline ---
 
 
 @mcp.tool(description="""\
-Search the web using DuckDuckGo. Returns search results with title, URL, and snippet.
+Run the full secure research pipeline for a topic.
 
-Use this to find relevant sources for a research topic. Run multiple queries \
-to cover different angles. The calling agent decides what to search for — \
-this tool just executes the search.
+This is the primary tool. It handles the complete workflow:
+1. Searches for relevant sources (DuckDuckGo)
+2. Fetches and sanitizes web pages (injection pattern detection)
+3. Extracts structured data via isolated AI subagent (researcher)
+4. Validates extractions against schema + enforces sanitizer floor
+5. Cross-references multiple sources via isolated AI subagent (analyst)
+6. Builds scored result with confidence levels
 
-Returns a list of {title, url, snippet} objects per query.\
+Security: AI extraction and analysis run as isolated subagents with no
+tools, no project context, and no ability to affect the calling system.
+
+Args:
+  topic: What to research (e.g., "Valheim inventory system")
+  schema: Domain schema defining what data to extract (JSON object)
+  trust_level: "strict" (3+ sources, any anomaly rejects),
+               "standard" (2+ preferred, anomalies logged),
+               "exploratory" (1 source OK, lower confidence)
+  max_sources: Maximum number of sources to fetch (default 3)
+  urls: Optional list of specific URLs to include. If fewer than
+        max_sources, additional sources are searched.
+
+Returns the full research result with data, confidence scores,
+anomaly summary, and quality report.\
+""")
+async def secure_research(
+    topic: str,
+    schema: dict,
+    trust_level: str = "standard",
+    max_sources: int = 3,
+    urls: list[str] | None = None,
+) -> str:
+    """Run the full secure research pipeline."""
+
+    # --- Pre-flight: validate schema ---
+    schema_result = validate_caller_schema(schema)
+    if not schema_result.valid:
+        return json.dumps({
+            "error": "Schema validation failed",
+            "errors": schema_result.errors,
+            "warnings": schema_result.warnings,
+        }, indent=2)
+
+    # --- Stage 1a: Discover sources ---
+    source_urls = list(urls or [])
+
+    if len(source_urls) < max_sources:
+        try:
+            queries = _build_search_queries(topic, schema)
+            seen_urls = set(source_urls)
+            for query in queries:
+                if len(source_urls) >= max_sources:
+                    break
+                results = execute_web_search(query, max_results=5)
+                for r in results:
+                    if r["url"] not in seen_urls and len(source_urls) < max_sources:
+                        source_urls.append(r["url"])
+                        seen_urls.add(r["url"])
+        except Exception as e:
+            if not source_urls:
+                return json.dumps({
+                    "error": f"Search failed and no URLs provided: {e}",
+                }, indent=2)
+            logger.warning(f"Search failed, proceeding with provided URLs: {e}")
+
+    if not source_urls:
+        return json.dumps({
+            "error": "No sources found. Try different search terms or provide URLs directly.",
+        }, indent=2)
+
+    # --- Stage 1b: Fetch & Sanitize ---
+    fetch_result = await _fetch_and_sanitize(source_urls)
+    sources = fetch_result["sources"]
+    fetch_errors = fetch_result["errors"]
+
+    if not sources:
+        return json.dumps({
+            "error": "All fetches failed",
+            "fetch_errors": fetch_errors,
+        }, indent=2)
+
+    # --- Stage 2: Extract (isolated subagents) ---
+    extractions = []
+    extraction_errors = []
+
+    for source in sources:
+        try:
+            extraction = await run_researcher(
+                sanitized_text=source["sanitized_text"],
+                schema=schema,
+                topic=topic,
+            )
+            extractions.append({
+                "extraction": extraction,
+                "source": source,
+            })
+        except Exception as e:
+            logger.error(f"Extraction failed for {source['url']}: {e}")
+            extraction_errors.append({
+                "url": source["url"],
+                "error": str(e),
+            })
+
+    if not extractions:
+        return json.dumps({
+            "error": "All extractions failed",
+            "extraction_errors": extraction_errors,
+            "fetch_errors": fetch_errors,
+        }, indent=2)
+
+    # --- Stage 3a: Validate each extraction ---
+    validated = []
+    for item in extractions:
+        extraction = item["extraction"]
+        source = item["source"]
+
+        # Schema validation
+        validation_result = _validate_extraction(extraction, schema)
+
+        # Sanitizer floor enforcement
+        extraction = _apply_sanitizer_floor(
+            source.get("injection_patterns", []),
+            extraction,
+        )
+
+        validated.append({
+            "extraction": extraction,
+            "validation": validation_result.to_dict(),
+            "source_info": {
+                "url": source["url"],
+                "fetch_date": source["fetch_date"],
+                "warnings": source.get("warnings", []),
+            },
+        })
+
+    # --- Stage 3b: Cross-reference (if multiple sources) ---
+    if len(validated) == 1:
+        v = validated[0]
+        result = _build_result_single(
+            extraction=v["extraction"],
+            validation_result=v["validation"],
+            source_info=v["source_info"],
+            schema=schema,
+            topic=topic,
+            trust_level=trust_level,
+        )
+    else:
+        try:
+            sanitized_extractions = [
+                _sanitize_for_analyst(v["extraction"])
+                for v in validated
+            ]
+
+            analyst_output = await run_analyst(
+                sanitized_extractions=sanitized_extractions,
+                schema=schema,
+                topic=topic,
+                trust_level=trust_level,
+            )
+
+            result = _build_result_multi(
+                analyst_output=analyst_output,
+                extractions=[v["extraction"] for v in validated],
+                validation_results=[v["validation"] for v in validated],
+                source_infos=[v["source_info"] for v in validated],
+                schema=schema,
+                topic=topic,
+                trust_level=trust_level,
+            )
+        except Exception as e:
+            logger.error(f"Analyst subagent failed: {e}")
+            # Fall back to single-source result from best extraction
+            v = validated[0]
+            result = _build_result_single(
+                extraction=v["extraction"],
+                validation_result=v["validation"],
+                source_info=v["source_info"],
+                schema=schema,
+                topic=topic,
+                trust_level=trust_level,
+            )
+            result["_analyst_error"] = str(e)
+            result["_fallback"] = "analyst_failed_using_first_source"
+
+    # Attach metadata about the pipeline run
+    result["_pipeline"] = {
+        "sources_searched": len(source_urls),
+        "sources_fetched": len(sources),
+        "sources_extracted": len(extractions),
+        "fetch_errors": fetch_errors,
+        "extraction_errors": extraction_errors,
+    }
+
+    return json.dumps(result, indent=2)
+
+
+def _build_search_queries(topic: str, schema: dict) -> list[str]:
+    """Build search queries from the topic and schema fields."""
+    queries = [topic]
+
+    field_names = list(schema.get("fields", {}).keys())
+    if field_names:
+        key_fields = " ".join(field_names[:3])
+        queries.append(f"{topic} {key_fields}")
+
+    queries.append(f"{topic} wiki")
+
+    domain = schema.get("domain", "")
+    if domain:
+        queries.append(f"{topic} {domain} details")
+
+    return queries[:4]
+
+
+# --- Schema Validation Tool ---
+
+
+@mcp.tool(description="""\
+Validate a domain schema before using it with secure_research.
+
+Checks required keys, valid field types, range/enum definitions, etc.
+
+Returns {valid: bool, errors: [...], warnings: [...]}.\
+""")
+def validate_research_schema(schema: dict) -> str:
+    """Validate a domain schema."""
+    try:
+        result = validate_caller_schema(schema)
+        return json.dumps({
+            "valid": result.valid,
+            "errors": result.errors,
+            "warnings": result.warnings,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "valid": False,
+            "errors": [f"Schema validation failed: {e}"],
+            "warnings": [],
+        }, indent=2)
+
+
+# --- Individual Pipeline Tools (for debugging/manual use) ---
+
+
+@mcp.tool(description="""\
+Search the web using DuckDuckGo. Returns search results.
+Exposed for debugging — secure_research calls this internally.\
 """)
 def search_web(
     queries: list[str],
@@ -77,21 +329,8 @@ def search_web(
 
 
 @mcp.tool(description="""\
-Fetch web pages and run the full sanitization pipeline on each.
-
-Takes a list of URLs, fetches them in parallel, and returns sanitized text \
-with injection pattern detection. The sanitized text is safe to pass to an \
-extraction subagent.
-
-Returns {sources: [...], errors: [...]} where each source has:
-- url, fetch_date, sanitized_text
-- injection_patterns: any prompt injection patterns detected (list)
-- warnings: sanitization warnings
-- original_length, sanitized_length, truncated
-
-IMPORTANT: The sanitized_text may be very large. For the extraction step, \
-pass each source's sanitized_text to an isolated subagent along with the \
-schema and the researcher agent spec (from get_agent_spec('researcher')).\
+Fetch web pages and run the sanitization pipeline.
+Exposed for debugging — secure_research calls this internally.\
 """)
 async def fetch_and_sanitize(urls: list[str]) -> str:
     """Fetch URLs and sanitize content."""
@@ -100,167 +339,8 @@ async def fetch_and_sanitize(urls: list[str]) -> str:
 
 
 @mcp.tool(description="""\
-Validate a domain schema before using it in the research pipeline.
-
-Returns {valid: bool, errors: [...], warnings: [...]}.\
-""")
-def validate_schema(domain_schema: dict) -> str:
-    """Validate a domain schema."""
-    try:
-        result = validate_caller_schema(domain_schema)
-        return json.dumps({
-            "valid": result.valid,
-            "errors": result.errors,
-            "warnings": result.warnings,
-        }, indent=2)
-    except Exception:
-        return json.dumps({
-            "valid": False,
-            "errors": ["Schema validation failed unexpectedly"],
-            "warnings": [],
-        }, indent=2)
-
-
-@mcp.tool(description="""\
-Run deterministic schema validation on an extraction produced by the \
-researcher subagent. Checks structural validity, field types, ranges, \
-enum values, and required fields.
-
-Args:
-  extraction: the full JSON output from the researcher subagent
-  schema: the domain schema used for the extraction
-
-Returns {valid: bool, errors: [...], warnings: [...]}.\
-""")
-def validate_extraction(extraction: dict, schema: dict) -> str:
-    """Validate extraction against schema."""
-    result = _validate_extraction(extraction, schema)
-    return json.dumps(result.to_dict(), indent=2)
-
-
-@mcp.tool(description="""\
-Enforce a deterministic severity floor on the researcher's anomaly log \
-based on injection patterns the sanitizer detected.
-
-If the sanitizer found injection patterns but the researcher agent \
-downplayed or omitted them, this adds entries to the anomaly log at \
-the appropriate severity. This prevents a successful prompt injection \
-from silencing its own detection.
-
-Call this AFTER extraction, BEFORE building the final result.
-
-Args:
-  injection_patterns: the injection_patterns list from fetch_and_sanitize
-  extraction: the full JSON output from the researcher subagent
-
-Returns the extraction dict, possibly with additional anomaly_log entries.\
-""")
-def apply_sanitizer_floor(injection_patterns: list, extraction: dict) -> str:
-    """Apply sanitizer floor to extraction."""
-    result = _apply_sanitizer_floor(injection_patterns, extraction)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(description="""\
-Strip raw web content from an extraction before passing to the analyst \
-subagent. The analyst should NEVER see raw source text — only structured \
-field values and anomaly metadata.
-
-Call this when preparing data for the analyst subagent (multi-source only).
-
-Args:
-  extraction: the full JSON output from the researcher subagent
-
-Returns a sanitized version safe for the analyst to consume.\
-""")
-def sanitize_for_analyst(extraction: dict) -> str:
-    """Sanitize extraction for analyst consumption."""
-    result = _sanitize_for_analyst(extraction)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(description="""\
-Build the final scored result from a single-source extraction.
-
-Use this when you have only one source. Applies confidence scoring, \
-anomaly assessment, trust level rules, and status determination.
-
-Args:
-  extraction: the researcher subagent's full JSON output (after sanitizer floor)
-  validation_result: output of validate_extraction as a dict
-  source_info: {url, fetch_date, warnings} for the source
-  schema: the domain schema
-  topic: research topic string
-  trust_level: "strict" | "standard" | "exploratory"
-
-Returns the complete research result dict.\
-""")
-def build_result_single(
-    extraction: dict,
-    validation_result: dict,
-    source_info: dict,
-    schema: dict,
-    topic: str,
-    trust_level: str = "standard",
-) -> str:
-    """Build single-source result."""
-    result = _build_result_single(
-        extraction, validation_result, source_info,
-        schema, topic, trust_level,
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(description="""\
-Build the final scored result from multi-source analyst output.
-
-Use this when you have 2+ sources and have run the analyst subagent. \
-Takes the analyst's consensus output and applies trust level rules, \
-confidence scoring, and status determination.
-
-Args:
-  analyst_output: the analyst subagent's full JSON output
-  extractions: list of researcher subagent outputs (one per source)
-  validation_results: list of validate_extraction results (one per source)
-  source_infos: list of {url, fetch_date, warnings} per source
-  schema: the domain schema
-  topic: research topic string
-  trust_level: "strict" | "standard" | "exploratory"
-
-Returns the complete research result dict.\
-""")
-def build_result_multi(
-    analyst_output: dict,
-    extractions: list[dict],
-    validation_results: list[dict],
-    source_infos: list[dict],
-    schema: dict,
-    topic: str,
-    trust_level: str = "standard",
-) -> str:
-    """Build multi-source result."""
-    result = _build_result_multi(
-        analyst_output, extractions, validation_results,
-        source_infos, schema, topic, trust_level,
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(description="""\
-Load an agent specification for use as a subagent system prompt.
-
-Available agents:
-- "researcher": Extraction agent — reads sanitized text, outputs structured JSON. \
-Use as the system prompt for an isolated extraction subagent. The subagent should \
-receive ONLY the agent spec + sanitized text + schema. No project context.
-- "analyst": Cross-reference agent — compares multiple extractions, produces \
-consensus. Use as the system prompt for an isolated analysis subagent. The subagent \
-should receive ONLY the agent spec + sanitized extractions (from sanitize_for_analyst). \
-Never raw web content.
-- "search": Search strategy agent spec (reference only — search is handled by \
-the calling agent directly).
-
-Returns the full markdown specification text.\
+Load an agent specification. Available: "researcher", "analyst", "search".
+Exposed for reference — secure_research uses these internally via subagents.\
 """)
 def get_agent_spec(agent_name: str) -> str:
     """Load an agent specification."""

@@ -6,7 +6,6 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]",
     "httpx",
-    "anthropic",
     "duckduckgo-search",
 ]
 
